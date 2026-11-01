@@ -166,9 +166,10 @@ const TW=500,TL=1000,R=18,RW=36,CG=46,SG=34,TAU=Math.PI*2;
 // ---------- physics (units: 1 table width = 500) ----------
 const MU_S=650,ROLL_A=95,ROLL_K=0.32,SIDE_DEC=160,MAXV=3300,MINV=45,E_BALL=0.95,E_RAIL=0.76,RAIL_SPIN=0.22;
 const HEADY=TL*0.75,FOOTY=TL*0.25;
-const POCKETS=[{x:0,y:0,r:33},{x:TW,y:0,r:33},{x:0,y:TL,r:33},{x:TW,y:TL,r:33},{x:0,y:TL/2,r:27},{x:TW,y:TL/2,r:27}];
+// a ball drops when its center is over the hole (matches what you see)
+const POCKETS=[{x:-2,y:-2,r:23},{x:TW+2,y:-2,r:23},{x:-2,y:TL+2,r:23},{x:TW+2,y:TL+2,r:23},{x:-3,y:TL/2,r:21},{x:TW+3,y:TL/2,r:21}];
 const AIMPTS=[{x:7,y:7},{x:TW-7,y:7},{x:7,y:TL-7},{x:TW-7,y:TL-7},{x:-5,y:TL/2,side:true},{x:TW+5,y:TL/2,side:true}];
-const HOLES=[{x:-5,y:-5,r:31},{x:TW+5,y:-5,r:31},{x:-5,y:TL+5,r:31},{x:TW+5,y:TL+5,r:31},{x:-8,y:TL/2,r:28},{x:TW+8,y:TL/2,r:28}];
+const HOLES=[{x:-2,y:-2,r:25},{x:TW+2,y:-2,r:25},{x:-2,y:TL+2,r:25},{x:TW+2,y:TL+2,r:25},{x:-3,y:TL/2,r:23},{x:TW+3,y:TL/2,r:23}];
 const SEGS=[
   {a:[0,CG],b:[0,TL/2-SG],n:[-1,0]},{a:[0,TL/2+SG],b:[0,TL-CG],n:[-1,0]},
   {a:[TW,CG],b:[TW,TL/2-SG],n:[1,0]},{a:[TW,TL/2+SG],b:[TW,TL-CG],n:[1,0]},
@@ -592,32 +593,72 @@ function cpuTurn(){
   cpuAnim={from:aim,d,t0:performance.now(),power:plan.power};
 }
 
-// ---------- sound ----------
-let ac=null,noiseBuf=null,lastClack=0;
+// ---------- sound (synthesized: ball resonances, cue tip, cushion, pocket, rolling, room) ----------
+let ac=null,master=null,verb=null,noiseBuf=null,lastClack=0,rollGain=null,rollFilt=null;
 function initAudio(){
   if(ac){if(ac.state==='suspended')ac.resume();return;}
   try{
     ac=new (window.AudioContext||window.webkitAudioContext)();
-    const len=Math.floor(ac.sampleRate*0.06);noiseBuf=ac.createBuffer(1,len,ac.sampleRate);
-    const d=noiseBuf.getChannelData(0);for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/len,7);
+    const sr=ac.sampleRate;
+    master=ac.createDynamicsCompressor();master.threshold.value=-14;master.ratio.value=4;master.connect(ac.destination);
+    verb=ac.createConvolver();const il=Math.floor(sr*0.45),ib=ac.createBuffer(2,il,sr);
+    for(let ch=0;ch<2;ch++){const d=ib.getChannelData(ch);for(let i=0;i<il;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/il,3.2);}
+    verb.buffer=ib;const wet=ac.createGain();wet.gain.value=0.16;verb.connect(wet);wet.connect(master);
+    const len=Math.floor(sr*0.08);noiseBuf=ac.createBuffer(1,len,sr);
+    const d=noiseBuf.getChannelData(0);for(let i=0;i<len;i++)d[i]=Math.random()*2-1;
+    const rl=sr*2,rb=ac.createBuffer(1,rl,sr),rd=rb.getChannelData(0);let last=0;
+    for(let i=0;i<rl;i++){last=(last+0.02*(Math.random()*2-1))/1.02;rd[i]=last*3.5;}
+    const rs=ac.createBufferSource();rs.buffer=rb;rs.loop=true;
+    rollFilt=ac.createBiquadFilter();rollFilt.type='lowpass';rollFilt.frequency.value=220;
+    rollGain=ac.createGain();rollGain.gain.value=0;rs.connect(rollFilt);rollFilt.connect(rollGain);rollGain.connect(master);rs.start();
   }catch(e){ac=null;}
 }
+function out(node,send){node.connect(master);if(send)node.connect(verb);}
+function burst(t,vol,type,freq,q,decay,send=true){
+  const src=ac.createBufferSource();src.buffer=noiseBuf;src.playbackRate.value=0.9+Math.random()*0.2;
+  const f=ac.createBiquadFilter();f.type=type;f.frequency.value=freq;f.Q.value=q;
+  const g=ac.createGain();g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(0.0001,t+decay);
+  src.connect(f);f.connect(g);out(g,send);src.start(t);src.stop(t+decay+0.02);
+}
+function tone(t,vol,freq,decay,type='sine',glide=1,send=true){
+  const o=ac.createOscillator();o.type=type;o.frequency.setValueAtTime(freq,t);
+  if(glide!==1)o.frequency.exponentialRampToValueAtTime(freq*glide,t+decay);
+  const g=ac.createGain();g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(vol,t+0.0015);g.gain.exponentialRampToValueAtTime(0.0001,t+decay);
+  o.connect(g);out(g,send);o.start(t);o.stop(t+decay+0.02);
+}
 function sound(kind,vol){
-  if(muted||!ac||!settings.sound)return;vol=clamp(vol,0,1);if(vol<0.02)return;
-  const t=ac.currentTime;
-  if(kind==='clack'){if(t-lastClack<0.012)return;lastClack=t;}
+  if(muted||!ac||!settings.sound)return;vol=clamp(vol,0,1);if(vol<0.015)return;
+  const t=ac.currentTime+0.005,v=Math.pow(vol,0.7);
   try{
-    const g=ac.createGain();g.connect(ac.destination);
-    if(kind==='pocket'){
-      const o=ac.createOscillator();o.type='sine';o.frequency.setValueAtTime(150,t);o.frequency.exponentialRampToValueAtTime(55,t+0.18);
-      g.gain.setValueAtTime(0.35*vol,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.22);o.connect(g);o.start(t);o.stop(t+0.25);return;
+    if(kind==='clack'){
+      if(t-lastClack<0.008)return;lastClack=t;
+      const p=0.94+Math.random()*0.12;
+      burst(t,0.55*v,'bandpass',3200+2600*v,1.4,0.012);
+      tone(t,0.32*v,2350*p,0.045);
+      tone(t,0.20*v,3720*p,0.03);
+      tone(t,0.10*v,5600*p,0.018);
+      tone(t,0.08*v,880*p,0.025);
+    }else if(kind==='cue'){
+      burst(t,0.45*v,'lowpass',1400+1800*v,0.7,0.035);
+      tone(t,0.22*v,1150,0.03);
+      tone(t,0.25*v,190,0.07,'sine',0.7);
+      if(v>0.6)burst(t,0.2*v,'bandpass',4200,2,0.01);
+    }else if(kind==='rail'){
+      tone(t,0.38*v,115,0.12,'sine',0.75);
+      burst(t,0.30*v,'lowpass',450,0.8,0.06);
+      burst(t,0.08*v,'bandpass',1800,2,0.02);
+    }else if(kind==='pocket'){
+      tone(t,0.30,130,0.16,'sine',0.6);burst(t,0.22,'lowpass',380,0.7,0.1);
+      [0.07,0.14,0.2].forEach((d,i)=>{const k=0.5/(i+1);tone(t+d,0.12*k,1700+Math.random()*500,0.03);burst(t+d,0.12*k,'bandpass',2600,1.5,0.012);});
+      tone(t+0.09,0.12,95,0.2,'sine',0.8);
     }
-    const src=ac.createBufferSource();src.buffer=noiseBuf;const f=ac.createBiquadFilter();
-    if(kind==='clack'){f.type='bandpass';f.frequency.value=2600;f.Q.value=1.2;g.gain.value=0.9*vol;}
-    else if(kind==='rail'){f.type='lowpass';f.frequency.value=500;g.gain.value=0.7*vol;}
-    else{f.type='lowpass';f.frequency.value=1500;g.gain.value=0.6*vol;}
-    src.connect(f);f.connect(g);src.start(t);
   }catch(e){}
+}
+function updateRoll(){
+  if(!ac||!rollGain)return;
+  let s=0;if(phase==='roll')for(const b of balls)if(!b.p)s+=Math.hypot(b.vx,b.vy);
+  const target=settings.sound?Math.min(0.09,s/30000):0,t=ac.currentTime;
+  rollGain.gain.setTargetAtTime(target,t,0.06);rollFilt.frequency.setTargetAtTime(160+Math.min(400,s/12),t,0.1);
 }
 
 // ---------- ball rendering (lit 3D sphere, numbers roll with the ball) ----------
@@ -862,7 +903,7 @@ function drawTable(g){
   }
   // pockets with leather rim
   for(const h of HOLES){
-    g.fillStyle='#24160d';g.beginPath();g.arc(h.x,h.y,h.r+3,0,TAU);g.fill();
+    g.fillStyle='#24160d';g.beginPath();g.arc(h.x,h.y,h.r+2,0,TAU);g.fill();
     const pg=g.createRadialGradient(h.x+3,h.y+3,2,h.x,h.y,h.r);pg.addColorStop(0,'#000');pg.addColorStop(.75,'#060403');pg.addColorStop(1,'#1c120b');
     g.fillStyle=pg;g.beginPath();g.arc(h.x,h.y,h.r,0,TAU);g.fill();
   }
@@ -941,6 +982,7 @@ let last=performance.now();
 function frame(now){
   const dt=Math.min(0.033,(now-last)/1000);last=now;
   if(phase==='roll'){simulate(dt);if(allStopped())endShot();}
+  updateRoll();
   if(cpuAnim){
     const k=(now-cpuAnim.t0)/1000;
     const a=clamp(k/0.6,0,1),e=a<.5?2*a*a:1-Math.pow(-2*a+2,2)/2;aim=cpuAnim.from+cpuAnim.d*e;
